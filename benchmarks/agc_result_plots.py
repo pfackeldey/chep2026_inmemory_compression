@@ -19,22 +19,27 @@ import matplotlib.ticker as mticker
 
 
 def _densify_ticks(ax):
-    """Set x ticks at 100 k-event intervals and increase y ticks (~50% more)."""
-    ax.xaxis.set_major_locator(mticker.MultipleLocator(100_000))
+    """Increase y ticks (~50% more) and auto-fit x ticks."""
     ax.locator_params(axis="y", nbins=int(ax.yaxis.get_tick_space() * 1.5))
 
 
 def parse_filename(filename: str) -> dict:
     """Parse benchmark result filename to extract metadata.
 
-    Filenames follow the pattern:
-    - {cache}_{codec}_{entry_stop}.json
-    - e.g. ondisk_blosc_1000000.json
-    - e.g. inmemory_lru_500MiB_blosc_1000000.json
+    Supports two filename patterns:
+    - {cache}_{codec}_{entry_stop}.json   (coffea 2024+ with buffer cache)
+    - coffea07_{label}_{entry_stop}.json  (coffea 0.7 without buffer cache)
     """
     stem = Path(filename).stem
     parts = stem.split("_")
     entry_stop = int(parts[-1])
+
+    if parts[0] == "coffea07":
+        # Old coffea: coffea07_<label>_<entry_stop>.json
+        label = "_".join(parts[1:-1])
+        return {"cache": f"coffea07_{label}", "codec": "none", "entry_stop": entry_stop}
+
+    # New coffea: {cache}_{codec}_{entry_stop}.json
     codec = parts[-2]
     cache = "_".join(parts[:-2])
     return {"cache": cache, "codec": codec, "entry_stop": entry_stop}
@@ -142,11 +147,16 @@ def write_ondisk_disk_usage_tables(results_dir: str, output_dir: str) -> None:
 
 def _prettify_label(cache: str, codec: str) -> str:
     """Pretty-print a cache+codec combination for the legend."""
+    if cache.startswith("coffea07_"):
+        return "coffea 0.7 (default)"
+
     codec_label = "uncompressed" if codec == "none" else codec.capitalize()
 
     match cache:
         case "inmemory":
             return f"In-memory ({codec_label})"
+        case "nocache":
+            return "coffea 2026.4 (default)"
         case "ondisk":
             return f"On-disk ({codec_label})"
         case "inmemory_lru_100MiB":
@@ -158,41 +168,124 @@ def _prettify_label(cache: str, codec: str) -> str:
 
 
 def _resolve_style(key: tuple, all_keys: list) -> dict:
-    """Return matplotlib line style: highlighted or faded with distinct colors."""
-    highlight = {
-        ("inmemory", "none"): {"color": "black", "linewidth": 2.2, "zorder": 3},
-        ("inmemory", "blosc"): {"color": "#0072B2", "linewidth": 2.2, "zorder": 3},
-        ("ondisk", "none"): {"color": "#D55E00", "linewidth": 2.2, "zorder": 3},
-    }
-    if key in highlight:
-        return highlight[key]
+    """Return matplotlib line style grouped semantically by cache type.
 
-    # Assign a stable, distinct color from tab20 for every non-highlight series
+    Hue ~ cache type family (warm=pure in-mem, green=lru, blue=ondisk,
+    grey=coffea default).
+    Lightness ~ codec: none (darker), blosc (lighter).
+    """
+    cache, codec = key
+
+    # --- greyscale = coffea default (no buffer-cache) ---
+    if cache.startswith("coffea07_"):
+        return {"color": "#888888", "linewidth": 2.0, "zorder": 3,
+                "alpha": 1.0}
+    if cache == "nocache":
+        return {"color": "#000000", "linewidth": 2.0, "zorder": 3,
+                "alpha": 1.0}
+
+    # --- warm  = pure in-memory (unbounded) ---
+    if cache == "inmemory":
+        if codec == "blosc":
+            return {"color": "#E69F00", "linewidth": 2.2, "zorder": 3, "alpha": 1.0}
+        # faded
+        return {"color": "#D55E00", "linewidth": 1.0, "zorder": 1, "alpha": 0.40, "linestyle": "--"}
+
+    # --- green = LRU (evicting memory cache) ---
+    if cache in ("inmemory_lru_100MiB", "inmemory_lru_500MiB"):
+        return {"color": "#009E73", "linewidth": 1.0, "zorder": 1,
+                "alpha": 0.40, "linestyle": "--"} if codec == "none" else {"color": "#56B4C9", "linewidth": 1.0, "zorder": 1, "alpha": 0.40, "linestyle": "--"}
+
+    # --- blue = on-disk (cold storage) ---
+    if cache == "ondisk":
+        if codec == "none":
+            return {"color": "#0072B2", "linewidth": 2.2, "zorder": 3, "alpha": 1.0}
+        else:
+            return {"color": "#56B4E9", "linewidth": 1.0, "zorder": 1,
+                    "alpha": 0.40, "linestyle": "--"}
+
+    # Fallback for any unknown series
     cmap = plt.get_cmap("tab20")
-    other = [k for k in all_keys if k not in highlight]
-    idx = other.index(key)
+    other = [k for k in all_keys if not _is_highlighted(k)]
+    try:
+        idx = other.index(key)
+    except ValueError:
+        idx = 0
     color = cmap(idx % cmap.N)
-    return {"color": color, "linewidth": 1.0, "alpha": 0.45, "zorder": 1}
+    return {"color": color, "linewidth": 1.0, "alpha": 0.40, "linestyle": "--", "zorder": 1}
+
+
+def _is_highlighted(key: tuple) -> bool:
+    """Check if a series should get full-size markers (vs tiny)."""
+    cache, codec = key
+    if cache.startswith("coffea07_") or cache == "nocache":
+        return True
+    if cache == "inmemory" and codec == "blosc":
+        return True
+    if cache == "ondisk" and codec == "none":
+        return True
+    return False
+
+
+def _sort_by_peak_rss(data: dict, baseline_key: tuple | None) -> list:
+    """Return keys sorted by desired legend order.
+
+    Fixed top 4:
+        1. nocache + none
+        2. coffea07_* (any)
+        3. inmemory + blosc
+        4. ondisk + none
+    Remainder sorted by worst (highest) peak RSS → best (lowest) using the
+    largest entry_stop value present in every series.
+    """
+    # (cache, codec) -> sort_rank (lower = earlier in legend)
+    fixed_ranks = {
+        ("nocache", "none"): 0,
+        ("inmemory", "blosc"): 2,
+        ("ondisk", "none"): 3,
+    }
+
+    def _key(item):
+        key, points = item
+        cache, codec = key
+        # coffea07 entries get rank 1
+        if cache.startswith("coffea07_"):
+            return (1, 0.0)
+        # other fixed-rank entries
+        if key in fixed_ranks:
+            return (fixed_ranks[key], 0.0)
+        # everything else by peak RSS descending at last common entry_stop
+        if baseline_key and baseline_key in data:
+            last_es = data[baseline_key][-1][0]
+            for p in reversed(points):
+                if p[0] <= last_es:
+                    return (len(fixed_ranks) + 1, -p[1])
+        # fallback: use last point
+        return (len(fixed_ranks) + 1, -points[-1][1] if points else 0.0)
+
+    return [k for k, _ in sorted(data.items(), key=_key)]
 
 
 def plot_agc_results(data: dict, output_dir: str) -> None:
     """Create two figures: peak RSS vs entry stop and runtime vs entry stop."""
     os.makedirs(output_dir, exist_ok=True)
+    baseline_key = ("inmemory", "none")
+
+    keys_sorted = _sort_by_peak_rss(data, baseline_key)
 
     # --- Figure 1: Peak RSS vs Entry Stop ---
     fig, ax = plt.subplots(figsize=(10, 6))
-    keys_sorted = sorted(data.keys())
-    for (cache, codec), points in sorted(data.items()):
-        entry_stops = [p[0] for p in points]
+    for key in keys_sorted:
+        points = data[key]
+        cache, codec = key
+        entry_stops = [p[0] / 1e6 for p in points]
         peak_rss = [p[1] for p in points]
         label = _prettify_label(cache, codec)
-        style = _resolve_style((cache, codec), keys_sorted)
-        mkargs = {"marker": "o"} if (cache, codec) in {
-            ("inmemory", "none"), ("inmemory", "blosc"), ("ondisk", "none")
-        } else {"marker": "o", "markersize": 3}
+        style = _resolve_style(key, keys_sorted)
+        mkargs = {"marker": "o"} if _is_highlighted(key) else {"marker": "o", "markersize": 3}
         ax.plot(entry_stops, peak_rss, label=label, **mkargs, **style)
 
-    ax.set_xlabel("Number of events")
+    ax.set_xlabel("Number of events (millions)")
     ax.set_ylabel("Peak RSS (GB)")
     ax.set_title("Peak RSS vs Number of Events")
     ax.legend(title="Buffer Cache", loc="best")
@@ -204,18 +297,17 @@ def plot_agc_results(data: dict, output_dir: str) -> None:
 
     # --- Figure 2: Runtime vs Entry Stop ---
     fig, ax = plt.subplots(figsize=(10, 6))
-    keys_sorted = sorted(data.keys())
-    for (cache, codec), points in sorted(data.items()):
-        entry_stops = [p[0] for p in points]
+    for key in keys_sorted:
+        points = data[key]
+        cache, codec = key
+        entry_stops = [p[0] / 1e6 for p in points]
         runtimes = [p[2] for p in points]
         label = _prettify_label(cache, codec)
-        style = _resolve_style((cache, codec), keys_sorted)
-        mkargs = {"marker": "o"} if (cache, codec) in {
-            ("inmemory", "none"), ("inmemory", "blosc"), ("ondisk", "none")
-        } else {"marker": "o", "markersize": 3}
+        style = _resolve_style(key, keys_sorted)
+        mkargs = {"marker": "o"} if _is_highlighted(key) else {"marker": "o", "markersize": 3}
         ax.plot(entry_stops, runtimes, label=label, **mkargs, **style)
 
-    ax.set_xlabel("Number of events")
+    ax.set_xlabel("Number of events (millions)")
     ax.set_ylabel("Runtime (s)")
     ax.set_title("Runtime vs Number of Events")
     ax.legend(title="Buffer Cache", loc="best")
@@ -225,7 +317,7 @@ def plot_agc_results(data: dict, output_dir: str) -> None:
     fig.savefig(os.path.join(output_dir, "runtime_vs_entry_stop.pdf"))
     plt.close(fig)
 
-    baseline_key = ("inmemory", "none")
+    baseline_key = ("nocache", "none")
     if baseline_key not in data:
         print(f"Warning: baseline {baseline_key} not found; skipping relative plots")
         return
@@ -233,21 +325,21 @@ def plot_agc_results(data: dict, output_dir: str) -> None:
     # --- Figure 3: Relative Peak RSS Improvement ---
     rel_peak = compute_relative(data, baseline_key, metric_index=1)
     fig, ax = plt.subplots(figsize=(10, 6))
-    keys_sorted = sorted(rel_peak.keys())
-    for (cache, codec), points in sorted(rel_peak.items()):
-        entry_stops = [p[0] for p in points]
+    keys_sorted_rel = _sort_by_peak_rss(rel_peak, baseline_key)
+    for key in keys_sorted_rel:
+        points = rel_peak[key]
+        cache, codec = key
+        entry_stops = [p[0] / 1e6 for p in points]
         improvements = [p[1] for p in points]
         label = _prettify_label(cache, codec)
-        style = _resolve_style((cache, codec), keys_sorted)
-        mkargs = {"marker": "o"} if (cache, codec) in {
-            ("inmemory", "none"), ("inmemory", "blosc"), ("ondisk", "none")
-        } else {"marker": "o", "markersize": 3}
+        style = _resolve_style(key, keys_sorted_rel)
+        mkargs = {"marker": "o"} if _is_highlighted(key) else {"marker": "o", "markersize": 3}
         ax.plot(entry_stops, improvements, label=label, **mkargs, **style)
 
     ax.axhline(0, color="black", linestyle="-", linewidth=0.8)
-    ax.set_xlabel("Number of events")
+    ax.set_xlabel("Number of events (millions)")
     ax.set_ylabel("Relative improvement (%)")
-    ax.set_title("Peak RSS Relative Improvement (inmemory + none as baseline)")
+    ax.set_title("Peak RSS Relative Improvement (coffea 2026.4 as baseline)")
     ax.legend(title="Buffer Cache", loc="best")
     ax.grid(True, linestyle="--", alpha=0.5)
     _densify_ticks(ax)
@@ -258,21 +350,21 @@ def plot_agc_results(data: dict, output_dir: str) -> None:
     # --- Figure 4: Relative Runtime Improvement ---
     rel_runtime = compute_relative(data, baseline_key, metric_index=2)
     fig, ax = plt.subplots(figsize=(10, 6))
-    keys_sorted = sorted(rel_runtime.keys())
-    for (cache, codec), points in sorted(rel_runtime.items()):
-        entry_stops = [p[0] for p in points]
+    keys_sorted_rel = _sort_by_peak_rss(rel_runtime, baseline_key)
+    for key in keys_sorted_rel:
+        points = rel_runtime[key]
+        cache, codec = key
+        entry_stops = [p[0] / 1e6 for p in points]
         improvements = [p[1] for p in points]
         label = _prettify_label(cache, codec)
-        style = _resolve_style((cache, codec), keys_sorted)
-        mkargs = {"marker": "o"} if (cache, codec) in {
-            ("inmemory", "none"), ("inmemory", "blosc"), ("ondisk", "none")
-        } else {"marker": "o", "markersize": 3}
+        style = _resolve_style(key, keys_sorted_rel)
+        mkargs = {"marker": "o"} if _is_highlighted(key) else {"marker": "o", "markersize": 3}
         ax.plot(entry_stops, improvements, label=label, **mkargs, **style)
 
     ax.axhline(0, color="black", linestyle="-", linewidth=0.8)
-    ax.set_xlabel("Number of events")
+    ax.set_xlabel("Number of events (millions)")
     ax.set_ylabel("Relative improvement (%)")
-    ax.set_title("Runtime Relative Improvement (inmemory + none as baseline)")
+    ax.set_title("Runtime Relative Improvement (coffea 2026.4 as baseline)")
     ax.legend(title="Buffer Cache", loc="best")
     ax.grid(True, linestyle="--", alpha=0.5)
     _densify_ticks(ax)

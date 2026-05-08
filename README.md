@@ -16,5 +16,5 @@ Deployed at: https://pfackeldey.github.io/chep2026_inmemory_compression/poster.p
 
 May run ~1-2h...
 ```shell
-pixi run python benchmarks/agc.py
+./run_agc.sh
 ```

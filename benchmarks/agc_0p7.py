@@ -1,3 +1,9 @@
+"""
+AGC benchmark for coffea 0.7.x / awkward1 (no buffer cache support).
+
+Measures peak RSS and runtime as a function of entry_stop for comparison
+with coffea 2024+ which has buffer-cache based virtual arrays.
+"""
 import sys
 import copy
 import resource
@@ -6,6 +12,7 @@ import json
 import dataclasses
 import os
 import subprocess
+from pathlib import Path
 
 import awkward as ak
 import correctionlib
@@ -14,17 +21,34 @@ import numpy as np
 from coffea import processor
 from coffea.analysis_tools import PackedSelection
 from coffea.nanoevents import NanoAODSchema, NanoEventsFactory
-from coffea.nanoevents.mapping import BufferCache
-from numcodecs import Blosc
 import rich
-import zict
 
 NanoAODSchema.warn_missing_crossrefs = False
 
-# nentries = 1344000
 FNAME = "root://eospublic.cern.ch//eos/opendata/cms/mc/RunIISummer20UL16NanoAODv9/TTToHadronic_TuneCP5_13TeV-powheg-pythia8/NANOAODSIM/106X_mcRun2_asymptotic_v17-v1/130000/009086DB-1E42-7545-9A35-1433EC89D04B.root"
 
-# FROM: https://github.com/ikrommyd/virtual-array-agc/blob/main/utils/config.py#L60-L89
+# Resolve data paths: search upward from script location for data/ directory
+_SCRIPT_DIR = Path(__file__).parent.resolve()
+
+def _find_project_root(start: Path) -> Path:
+    """Walk upward until we find a data/ directory."""
+    current = start
+    for _ in range(5):  # Don't climb forever
+        if (current / "data").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    # Fallback: assume repo root is two levels above benchmarks/
+    return _SCRIPT_DIR.parent.parent
+
+_PROJECT_ROOT = _find_project_root(_SCRIPT_DIR)
+_DATA_DIR = _PROJECT_ROOT / "data"
+_INPUT_ROOT = str(_DATA_DIR / "input.root")
+_CORRECTIONS_JSON = str(_DATA_DIR / "corrections.json")
+
+# Fields to explicitly touch (forces buffer reads in lazy backends)
 additional_fields_to_touch = [
     "LHEPdfWeight",
     ("GenPart", "pt"),
@@ -58,7 +82,6 @@ additional_fields_to_touch = [
 
 
 def jet_pt_resolution(pt):
-    # normal distribution with 5% variations, shape matches jets
     counts = ak.num(pt)
     pt_flat = ak.flatten(pt)
     resolution_variation = np.random.normal(np.ones_like(pt_flat), 0.05)
@@ -67,7 +90,6 @@ def jet_pt_resolution(pt):
 
 class TtbarAnalysis(processor.ProcessorABC):
     def __init__(self):
-        # initialize dictionary of hists for signal and control region
         self.hist_dict = {}
         for region in ["4j1b", "4j2b"]:
             self.hist_dict[region] = (
@@ -79,16 +101,14 @@ class TtbarAnalysis(processor.ProcessorABC):
                 .Weight()
             )
 
-        self.cset = correctionlib.CorrectionSet.from_file("./data/corrections.json")
+        self.cset = correctionlib.CorrectionSet.from_file(_CORRECTIONS_JSON)
 
     def process(self, events):
-        # create copies of histogram objects
         hist_dict = copy.deepcopy(self.hist_dict)
 
-        process = events.metadata["process"]  # "ttbar" etc.
-        variation = events.metadata["variation"]  # "nominal" etc.
+        process = events.metadata["process"]
+        variation = events.metadata["variation"]
 
-        # normalization for MC
         x_sec = events.metadata["xsec"]
         nevts_total = events.metadata["nevts"]
         lumi = 3378  # /pb
@@ -97,15 +117,13 @@ class TtbarAnalysis(processor.ProcessorABC):
         else:
             xsec_weight = 1
 
-        # touch additional fields
+        # touch additional fields (best-effort for awkward1)
         for field in additional_fields_to_touch:
-            ak.materialize(events[field])
+            try:
+                _ = repr(events[field])  # repr to force read/materialize
+            except Exception:
+                pass
 
-        #### systematics
-        # jet energy scale / resolution systematics
-        # need to adjust schema to instead use coffea add_systematic feature, especially for ServiceX
-        # cannot attach pT variations to events.jet, so attach to events directly
-        # and subsequently scale pT by these scale factors
         events["pt_scale_up"] = 1.03
         events["pt_res_up"] = jet_pt_resolution(events.Jet.pt)
 
@@ -115,22 +133,15 @@ class TtbarAnalysis(processor.ProcessorABC):
         if process == "wjets":
             event_systs.append("scale_var")
 
-        # Only do systematics for nominal samples, e.g. ttbar__nominal
         if variation == "nominal":
             syst_variations.extend(jet_kinematic_systs)
             syst_variations.extend(event_systs)
 
-        # for pt_var in pt_variations:
         for syst_var in syst_variations:
-            ### event selection
-            # very very loosely based on https://arxiv.org/abs/2006.13076
-
-            # Note: This creates new objects, distinct from those in the 'events' object
             elecs = events.Electron
             muons = events.Muon
             jets = events.Jet
             if syst_var in jet_kinematic_systs:
-                # Replace jet.pt with the adjusted values
                 jets["pt"] = jets.pt * events[syst_var]
 
             electron_reqs = (
@@ -150,16 +161,13 @@ class TtbarAnalysis(processor.ProcessorABC):
                 (jets.pt > 30) & (np.abs(jets.eta) < 2.4) & (jets.isTightLeptonVeto)
             )
 
-            # Only keep objects that pass our requirements
             elecs = elecs[electron_reqs]
             muons = muons[muon_reqs]
             jets = jets[jet_reqs]
 
             B_TAG_THRESHOLD = 0.5
 
-            ######### Store boolean masks with PackedSelection ##########
             selections = PackedSelection(dtype="uint64")
-            # Basic selection criteria
             selections.add("exactly_1l", (ak.num(elecs) + ak.num(muons)) == 1)
             selections.add("atleast_4j", ak.num(jets) >= 4)
             selections.add(
@@ -168,7 +176,6 @@ class TtbarAnalysis(processor.ProcessorABC):
             selections.add(
                 "atleast_2b", ak.sum(jets.btagCSVV2 > B_TAG_THRESHOLD, axis=1) >= 2
             )
-            # Complex selection criteria
             selections.add(
                 "4j1b", selections.all("exactly_1l", "atleast_4j", "exactly_1b")
             )
@@ -187,21 +194,13 @@ class TtbarAnalysis(processor.ProcessorABC):
                     observable = ak.sum(region_jets.pt, axis=-1)
 
                 elif region == "4j2b":
-                    # reconstruct hadronic top as bjj system with largest pT
-                    trijet = ak.combinations(
-                        region_jets, 3, fields=["j1", "j2", "j3"]
-                    )  # trijet candidates
-                    trijet["p4"] = (
-                        trijet.j1 + trijet.j2 + trijet.j3
-                    )  # calculate four-momentum of tri-jet system
+                    trijet = ak.combinations(region_jets, 3, fields=["j1", "j2", "j3"])
+                    trijet["p4"] = trijet.j1 + trijet.j2 + trijet.j3
                     trijet["max_btag"] = np.maximum(
                         trijet.j1.btagCSVV2,
                         np.maximum(trijet.j2.btagCSVV2, trijet.j3.btagCSVV2),
                     )
-                    trijet = trijet[
-                        trijet.max_btag > B_TAG_THRESHOLD
-                    ]  # at least one-btag in trijet candidates
-                    # pick trijet candidate with largest pT and calculate mass of system
+                    trijet = trijet[trijet.max_btag > B_TAG_THRESHOLD]
                     trijet_mass = trijet["p4"][
                         ak.argmax(trijet.p4.pt, axis=1, keepdims=True)
                     ].mass
@@ -211,20 +210,20 @@ class TtbarAnalysis(processor.ProcessorABC):
                         continue
 
                 syst_var_name = f"{syst_var}"
-                # Break up the filling into event weight systematics and object variation systematics
                 if syst_var in event_systs:
                     for i_dir, direction in enumerate(["up", "down"]):
-                        # Should be an event weight systematic with an up/down variation
-                        if syst_var.startswith("btag_var"):
-                            i_jet = int(syst_var.rsplit("_", 1)[-1])  # Kind of fragile
-                            wgt_variation = self.cset["event_systematics"].evaluate(
-                                "btag_var", direction, region_jets.pt[:, i_jet]
-                            )
-                        elif syst_var == "scale_var":
-                            # The pt array is only used to make sure the output array has the correct shape
-                            wgt_variation = self.cset["event_systematics"].evaluate(
-                                "scale_var", direction, region_jets.pt[:, 0]
-                            )
+                        try:
+                            if syst_var.startswith("btag_var"):
+                                i_jet = int(syst_var.rsplit("_", 1)[-1])
+                                wgt_variation = self.cset["event_systematics"].evaluate(
+                                    "btag_var", direction, region_jets.pt[:, i_jet]
+                                )
+                            elif syst_var == "scale_var":
+                                wgt_variation = self.cset["event_systematics"].evaluate(
+                                    "scale_var", direction, region_jets.pt[:, 0]
+                                )
+                        except Exception:
+                            wgt_variation = 1.0
                         syst_var_name = f"{syst_var}_{direction}"
                         hist_dict[region].fill(
                             observable=observable,
@@ -233,9 +232,7 @@ class TtbarAnalysis(processor.ProcessorABC):
                             weight=region_weights * wgt_variation,
                         )
                 else:
-                    # Should either be 'nominal' or an object variation systematic
                     if variation != "nominal":
-                        # This is a 2-point systematic, e.g. ttbar__scaledown, ttbar__ME_var, etc.
                         syst_var_name = variation
                     hist_dict[region].fill(
                         observable=observable,
@@ -251,25 +248,6 @@ class TtbarAnalysis(processor.ProcessorABC):
         return accumulator
 
 
-def make_events(file, buffer_cache, entry_stop):
-    access_log = []
-    events = NanoEventsFactory.from_root(
-        {file: "Events"},
-        mode="virtual",
-        schemaclass=NanoAODSchema,
-        buffer_cache=buffer_cache,
-        access_log=access_log,
-        entry_stop=entry_stop,
-        metadata={
-            "process": "ttbar",
-            "variation": "nominal",
-            "xsec": 831.76,
-            "nevts": entry_stop,
-        },
-    ).events()
-    return events, access_log
-
-
 @dataclasses.dataclass
 class BenchmarkResult:
     execution_time: float
@@ -279,79 +257,27 @@ class BenchmarkResult:
     peak_rss: float
 
 
-
 if __name__ == "__main__":
-    CMD = ["pixi", "run"]
-
-    # first time, download some files
-    if not os.path.exists("data/input.root"):
-        print("Downloading input file to data/input.root...")
-        subprocess.run(CMD + ["xrdcp", FNAME, "./data/input.root"], check=True)
-
-    if not os.path.exists("data/corrections.json"):
-        print("Downloading corrections file...")
-        subprocess.run(
-            CMD
-            + [
-                "wget",
-                "https://raw.githubusercontent.com/ikrommyd/virtual-array-agc/refs/heads/main/corrections.json",
-                "-O",
-                "./data/corrections.json",
-            ],
-            check=True,
-        )
-
-    # Start measurements
-    assert len(sys.argv[1:]) == 3, (
-        "This benchmark only accepts three arguments: cache type, codec, entry_stop"
+    assert len(sys.argv[1:]) == 2, (
+        "Usage: agc_0p7.py <label> <entry_stop>  (e.g. agc_0p7.py no_buffer_cache 100000)"
     )
 
-    cache_type = sys.argv[1]
-    codec_type = sys.argv[2]
-    entry_stop = int(sys.argv[3])
+    label = sys.argv[1]
+    entry_stop = int(sys.argv[2])
 
-    match cache_type:
-        case "inmemory":
-            cache = {}
-        case "nocache":
-            cache = None
-        case "inmemory_lru_100MiB":
-            cache = zict.LRU(
-                n=100 * (1024**2),  # 100 MiB max size
-                d={},
-                weight=lambda k, v: len(v),
-            )
-        case "inmemory_lru_500MiB":
-            cache = zict.LRU(
-                n=500 * (1024**2),  # 500 MiB max size
-                d={},
-                weight=lambda k, v: len(v),
-            )
-        case "ondisk":
-            if os.path.exists("./cache_dir"):
-                print("Clearing existing cache directory...")
-                for f in os.listdir("./cache_dir"):
-                    os.remove(os.path.join("./cache_dir", f))
-            cache = zict.File("./cache_dir")
-        case _:
-            raise ValueError(f"Unknown cache type: {cache_type}")
+    file_path = _INPUT_ROOT
 
-    match codec_type:
-        case "blosc":
-            codec = Blosc("zstd", clevel=1, shuffle=Blosc.BITSHUFFLE)
-        case "none":
-            codec = None
-        case _:
-            raise ValueError(f"Unknown codec choice: {codec_type}")
-
-    result_base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "agc")
-    os.makedirs(result_base, exist_ok=True)
-    result_json = f"{result_base}/{cache_type}_{codec_type}_{entry_stop}.json"
-
-    buffer_cache = BufferCache(cache=cache, codec=codec) if cache is not None else None
-    events, access_log = make_events(
-        "./data/input.root", buffer_cache, entry_stop=entry_stop
-    )
+    events = NanoEventsFactory.from_root(
+        file_path,
+        schemaclass=NanoAODSchema,
+        entry_stop=entry_stop,
+        metadata={
+            "process": "ttbar",
+            "variation": "nominal",
+            "xsec": 831.76,
+            "nevts": entry_stop,
+        },
+    ).events()
 
     processor_instance = TtbarAnalysis()
 
@@ -360,24 +286,19 @@ if __name__ == "__main__":
     exec_time = time.monotonic() - t0
     peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
-    def _raw_bytes(v):
-        return v.nbytes if hasattr(v, "nbytes") else len(v)
-
-    touched = (
-        {a.buffer_key: _raw_bytes(cache.get(a.buffer_key, [])) for a in access_log}
-        if cache is not None
-        else {}
-    )
-    branches = list(set(a.branch for a in access_log)) if access_log else []
     result = BenchmarkResult(
         execution_time=exec_time,
         events_per_second=out["nevents"] / exec_time,
-        touched=touched,
-        branches=branches,
+        touched={},
+        branches=[],
         peak_rss=peak_rss,
     )
 
     rich.print(result)
+
+    result_base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "agc")
+    os.makedirs(result_base, exist_ok=True)
+    result_json = f"{result_base}/coffea07_{label}_{entry_stop}.json"
 
     with open(result_json, "w") as f:
         json.dump(dataclasses.asdict(result), f, indent=4)

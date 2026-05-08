@@ -1,0 +1,17 @@
+[workspace]
+authors = ["pfackeldey <fackeldey.peter@gmail.com>"]
+channels = ["conda-forge"]
+name = "agc07"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+agc07 = "python ../agc_0p7.py"
+
+[dependencies]
+coffea = "==0.7.22"
+setuptools = "<66"
+correctionlib = ">=2.8.0,<3"
+hist = ">=2.10.1,<3"
+rich = ">=15.0.0,<16"
+python = "3.10.*"
