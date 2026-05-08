@@ -1,0 +1,22 @@
+[workspace]
+authors = ["pfackeldey <fackeldey.peter@gmail.com>"]
+channels = ["conda-forge"]
+name = "chep2026_inmemory_compression"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+coffea = "==2026.4.0"
+numcodecs = ">=0.16.5,<0.17"
+zict = ">=3.0.0,<4"
+typst = ">=0.14.2,<0.15"
+wget = ">=1.25.0,<2"
+xrootd = ">=5.9.2,<6"
+correctionlib = ">=2.8.0,<3"
+hist = ">=2.10.1,<3"
+ipython = ">=9.13.0,<10"
+rich = ">=15.0.0,<16"
+matplotlib = ">=3.10.9,<4"
+python = "3.14.*"
