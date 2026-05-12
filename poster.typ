@@ -160,7 +160,7 @@ from coffea.nanoevents.mapping import BufferCache
 buffer_cache = BufferCache(...)
 
 factory = NanoEventsFactory.from_root(
-  {path: "Events"},
+  {"path/to/nanoaod.root": "Events"},
   mode="virtual",
   buffer_cache=buffer_cache,
 )
