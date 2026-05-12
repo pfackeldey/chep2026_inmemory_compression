@@ -154,7 +154,7 @@ New in coffea: plug any key-value store (`BufferCache`) underneath your arrays.
   ),
 )
 ```python
-from coffea.nanoevents import NanoAODSchema, NanoEventsFactory
+from coffea.nanoevents import NanoEventsFactory
 from coffea.nanoevents.mapping import BufferCache
 
 buffer_cache = BufferCache(...)
