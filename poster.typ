@@ -226,7 +226,7 @@ Comparing memory use for a typical coffea analysis, using the #emph[Analysis Gra
 - Peak RSS *reduced by up to #sym.approx$2$#sym.times* with on-disk caching
 - In-memory compression also reduces peak RSS vs default, especially at higher chunk sizes
 - Runtime overhead #sym.approx$1..30\%$ (depends on cache strategy and chunk size)
-  - Mitigated by larger chunks + codec tuning
+  - Can be mitigated by larger chunks and codec tuning
   - On-disk performance is _highly sensitive to disk bandwidth_\ *#sym.arrow.r understand your setup!*
 
 
