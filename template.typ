@@ -29,6 +29,7 @@
                   #v(15%, weak: true)
                 ]
                 #text(size: 42pt)[
+                  Peter Elmer#super[1],
                   *Peter Fackeldey#super[1]*, 
                   Iason Krommydas#super[2], 
                   \

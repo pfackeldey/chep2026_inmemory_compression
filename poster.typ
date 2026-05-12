@@ -208,7 +208,7 @@ buffer_cache = BufferCache(
 
 === 3. Custom / Tiered Caches
 
-Any `MutableMapping[str, bytes]` works — e.g. tiered caches that spill to disk once a memory threshold is reached, using `zict.LRU` or similar.
+Any `MutableMapping[str, bytes]` works — e.g. tiered caches that spill to disk once a memory threshold is reached, or distributed caches for shared access between users.
 
 
 = Benchmarks
@@ -217,7 +217,7 @@ Comparing memory use for a typical coffea analysis, using the #emph[Analysis Gra
 
 - No cache (default): `coffea 0.7` and `coffea 2026.4`
 - In-memory (`Blosc`)
-- On-disk (`zict.File`, SSD #sym.approx$10$ GB/s read speed)
+- On-disk (`zict.File`, SSD-backed)
 - Tiered LRU (`zict.LRU`)
 
 #figure(image("benchmarks/plots/peak_rss_vs_entry_stop.pdf", width: 100%, height: auto))
