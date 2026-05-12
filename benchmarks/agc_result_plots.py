@@ -199,7 +199,7 @@ def _resolve_style(key: tuple, all_keys: list) -> dict:
         return {"color": "#888888", "linewidth": 2.0, "zorder": 3,
                 "alpha": 1.0, "marker": "o"}
     if cache == "nocache":
-        return {"color": "#000000", "linewidth": 2.0, "zorder": 3,
+        return {"color": "#000000", "linewidth": 2.0, "zorder": 5,
                 "alpha": 1.0, "marker": "o"}
 
     # --- warm  = pure in-memory (unbounded) ---
