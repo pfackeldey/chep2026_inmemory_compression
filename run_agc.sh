@@ -14,7 +14,7 @@ action() {
     done
   done
 
-  --- 2. Modern coffea vanilla ---
+  # --- 2. Modern coffea vanilla ---
   for ((entry_stop=100000; entry_stop<=1000000; entry_stop+=50000))
   do
     echo "Running: pixi run python benchmarks/agc.py nocache none $entry_stop"
