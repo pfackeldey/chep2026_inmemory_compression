@@ -15,7 +15,7 @@
 )
 
 // global styling & colors
-#set text(size: 28pt)
+#set text(size: 34pt)
 #show link: set text(fill: blue)
 #show link: underline
 
@@ -26,35 +26,28 @@
 // poster content, function from `template.typ`
 #poster[
 
-= Memory is the most precious Resource...
+= Memory Limits Kill Your Jobs
 
-Workers have limited memory, and if the memory usage of a job exceeds that limit, processing will crash.
+Chunk too big #sym.arrow.r crash. Chunk too small #sym.arrow.r slow.
 
-Often limited memory results in small chunk sizes for processing, which leads to:
-- More overhead from scheduling many small jobs
-- Less efficient use of compiled and vectorized code, which performs better on larger data
-- Significant overhead from CPython
+Limited memory forces tiny chunks, causing:
+- Task scheduling overhead
+- Inefficient use of vectorized kernels
+- Python overhead
+
+*Reduced memory footprint #sym.arrow.r more robust & faster analysis*
 
 
-*#sym.arrow.r It's crucial for stability and performance to reduce memory usage!*
+= How Awkward Arrays Are Stored in Memory
 
+Nested data (e.g. per-event jet lists) are stored as flat 1D buffers:
+- *Offsets:* where each event starts/ends
+- *Values:* all data flattened into one array
 
-= Coffea analysis with Awkward Arrays
+100k events #sym.arrow.r just 2 contiguous buffers (not 100k Python lists!).
 
-Many modern HEP analyses are powered by Awkward Arrays, which are designed to handle complex, variable-length data structures efficiently, and coffea, which provides seamless cluster-scaling and physics-intuitive tools for analysis.
-
-For reducing memory usage we have to first understand how Awkward Arrays are stored in memory.
-
-=== How Awkward Arrays are Stored in Memory
-
-Awkward Arrays represent nested, variable-length data (e.g. per-event lists of particles) as a *collection of flat 1D buffers*. Each variable-length field uses two fundamental buffers:
-
-- *Offsets:* A 1D array of integers defining the start and end positions for each event's data in the values buffer.
-- *Values:* A flattened 1D array holding the actual data values for all events, end-to-end.
-
-This means an array of 100k events with a variable number of jets is stored as just two contiguous 1D buffers, rather than a Python list of 100k variable-length arrays.
-
-Crucially, each individual buffer is identified by a *unique buffer key* (a string). This design maps naturally onto a key-value store: the buffer key is the lookup key, and the 1D buffer data is the value, which can be compressed to bytes before storage.
+Each buffer has a *unique key*.
+This maps naturally to a key-value store for compression and lazy lookup.
 
 #align(center)[
   #grid(
@@ -68,7 +61,7 @@ Crucially, each individual buffer is identified by a *unique buffer key* (a stri
     ],
     align(horizon + left)[
       #box(
-        width: 76%,
+        width: 92%,
         stroke: gray,
         inset: 1em,
         radius: 0.5em,
@@ -95,7 +88,7 @@ Crucially, each individual buffer is identified by a *unique buffer key* (a stri
     ],
     align(horizon + left)[
       #box(
-        width: 76%,
+        width: 92%,
         stroke: gray,
         inset: 1em,
         radius: 0.5em,
@@ -120,7 +113,7 @@ Crucially, each individual buffer is identified by a *unique buffer key* (a stri
     ],
     align(horizon + left)[
       #box(
-        width: 76%,
+        width: 92%,
         stroke: orange,
         inset: 1em,
         radius: 0.5em,
@@ -135,7 +128,7 @@ Crucially, each individual buffer is identified by a *unique buffer key* (a stri
             align(left)[Offsets],
             align(right)[#raw("data/jets/pt")],
             align(center)[ #sym.arrow.r ],
-            align(left)[Contents],
+            align(left)[Values],
           )
         ]
       )
@@ -143,12 +136,15 @@ Crucially, each individual buffer is identified by a *unique buffer key* (a stri
   )
 ]
 
-*Why this matters:* Since each buffer is an independent, contiguous chunk of memory, we can store them individually. _Only buffers that are actually accessed during analysis will be read from the key-value store._ This allows us to implement efficient key-value stores that can reduce the in-memory footprint of Awkward Arrays.
+*Benefits of a Key-Value Store for Buffers:*
+- Full control over caching strategy
+- Only accessed buffers are loaded into the key-value store (VirtualArrays)
+- Transparent to users
 
-= Key-Value Caches for Awkward Arrays
 
-We extended coffea to support a pluggable key-value cache interface for Awkward Array buffers, called `BufferCache`. 
-This allows users to implement custom caching strategies:
+= Solution: `BufferCache` for Awkward Arrays
+
+New in coffea: plug any key-value store (`BufferCache`) underneath your arrays.
 
 #codly(
   languages: codly-languages,
@@ -170,15 +166,13 @@ factory = NanoEventsFactory.from_root(
 )
 ```
 
-In the following, we will discuss different cache implementations, and how to use them with the `BufferCache` to reduce memory usage in coffea analyses.
+Three strategies below:
 
-=== In-memory Compression with BufferCache
+=== 1. In-Memory Compression
 
-We can use the `BufferCache` to implement in-memory compression of Awkward Array buffers. 
-By compressing the buffer data before storing it in the cache, we can significantly reduce the memory footprint of the arrays.
-Only upon access are the buffers decompressed and loaded into memory, allowing for larger chunk sizes and more efficient processing without exceeding memory limits.
+Compress buffers before caching. Decompress only on access → larger chunks, same memory limit.
 
-To use in-memory compression, we can utilize a codec from the `numcodecs` library, such as `Blosc`, which provides fast compression and decompression:
+*Example with Blosc:*
 
 #codly(
   languages: codly-languages,
@@ -194,13 +188,9 @@ buffer_cache = BufferCache(
 )
 ```
 
-=== On-disk Caching with BufferCache
+=== 2. On-Disk Caching
 
-The most aggressive way to reduce memory usage is to use an on-disk cache. 
-By storing the buffers on disk instead of in memory, we can effectively bypass memory limitations. 
-This allows for processing arbitrarily large datasets, at the cost of increased latency due to disk I/O.
-
-To implement an on-disk cache, we can use a simple file-based approach or leverage libraries like `zict` for more sophisticated caching strategies.
+Spill buffers to disk. Bypasses memory limits entirely — at the cost of I/O latency.
 
 #codly(
   languages: codly-languages,
@@ -216,29 +206,32 @@ buffer_cache = BufferCache(
 )
 ```
 
-=== Other Cache Implementations
+=== 3. Custom / Tiered Caches
 
-`BufferCache` is flexible and allows for any cache implementation that follows the `MutableMapping[str, bytes]` interface. 
-This means users can implement custom caching strategies, such as tiered LRU caches using `zict.LRU`.
+Any `MutableMapping[str, bytes]` works — e.g. tiered caches that spill to disk once a memory threshold is reached, using `zict.LRU` or similar.
 
 
-= Benchmarks and Performance
+= Benchmarks
 
-In the following, we will show benchmarks comparing the memory usage and performance of different caching strategies using `BufferCache` in a typical coffea analysis. We will compare:
-- No cache (default) for awkward v1 (#raw("coffea 0.7")) and v2 (#raw("coffea 2027.4"))
-- In-memory compression with `Blosc` (#raw("In-memory ..."))
-- On-disk caching with `zict.File` using SSD with #sym.approx$10$GB/s read speed (#raw("On-disk ..."))
-- Tiered LRU caching with `zict.LRU` with a threshold in MiB (#raw("In-memory LRU ..."))
+Comparing memory use for a typical coffea analysis, using the #emph[Analysis Grand Challenge] with a CMS open data t#overline[t] NanoAOD sample:
+
+- No cache (default): `coffea 0.7` and `coffea 2026.4`
+- In-memory (`Blosc`)
+- On-disk (`zict.File`, SSD #sym.approx$10$ GB/s read speed)
+- Tiered LRU (`zict.LRU`)
 
 #figure(image("benchmarks/plots/peak_rss_vs_entry_stop.pdf", width: 100%, height: auto))
 
+*Results*
+- Peak RSS *reduced by up to #sym.approx$2$#sym.times* with on-disk caching
+- In-memory compression also reduces peak RSS vs default, especially at higher chunk sizes
+- Runtime overhead #sym.approx$1..30\%$ (depends on cache strategy and chunk size)
+  - Mitigated by larger chunks + codec tuning
+  - On-disk performance is _highly sensitive to disk bandwidth_\ *#sym.arrow.r understand your setup!*
 
-The *peak RSS (resident set size) is significantly reduced* with in-memory compression, and even more so with on-disk caching by up to a factor of #sym.approx$2$#sym.times compared to no caching.
 
-It should be noted that these caching strategies come at the cost of slightly increased runtime due to the overhead of compression and disk I/O.
-In this benchmark, the runtime overhead of these strategies was in the range of #sym.approx$1..10\%$. Much of this can be mitigated by increasing the chunk size again (making more use of compiled kernels) and by tuning the cache settings (e.g. compression levels).
-Especially on-disk caching can lead to significant increases in runtime if the disk bandwidth is low and thus needs to be _carefully assessed per compute infrastructure_.
-
-*#sym.arrow.r Check out `coffea>=2026.4` if you struggle with memory limits in your analysis!*
+\
+#set text(size: 40pt)
+*#sym.arrow.r Try `coffea>=2026.4` if memory limits slow you down!*
 
 ]

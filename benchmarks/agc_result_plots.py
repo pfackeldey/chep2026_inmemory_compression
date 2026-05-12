@@ -17,6 +17,16 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
+plt.rcParams.update({
+    "font.size": 16,
+    "axes.labelsize": 18,
+    "axes.titlesize": 20,
+    "legend.fontsize": 16,
+    "legend.title_fontsize": 17,
+    "xtick.labelsize": 15,
+    "ytick.labelsize": 15,
+})
+
 
 def _densify_ticks(ax):
     """Increase y ticks (~50% more) and auto-fit x ticks."""
@@ -54,6 +64,16 @@ def collect_data(results_dir: str) -> dict:
     data = defaultdict(list)
     for filepath in sorted(Path(results_dir).glob("*.json")):
         meta = parse_filename(filepath.name)
+
+        # Exclude inmemory+uncompressed, LRU 100 MiB, and LRU 500 MiB uncompressed lines from plots
+        if (meta["cache"], meta["codec"]) in {
+            ("inmemory", "none"),
+            ("inmemory_lru_100MiB", "none"),
+            ("inmemory_lru_100MiB", "blosc"),
+            ("inmemory_lru_500MiB", "none"),
+        }:
+            continue
+
         with open(filepath, "r") as f:
             content = json.load(f)
         peak_rss_gb = content["peak_rss"] / (1024**3)
@@ -159,10 +179,8 @@ def _prettify_label(cache: str, codec: str) -> str:
             return "coffea 2026.4 (default)"
         case "ondisk":
             return f"On-disk ({codec_label})"
-        case "inmemory_lru_100MiB":
-            return f"In-memory LRU 100 MiB ({codec_label})"
         case "inmemory_lru_500MiB":
-            return f"In-memory LRU 500 MiB ({codec_label})"
+            return f"LRU 500 MiB ({codec_label})"
         case _:  # pragma: no cover
             return f"{cache} ({codec_label})"
 
@@ -179,30 +197,28 @@ def _resolve_style(key: tuple, all_keys: list) -> dict:
     # --- greyscale = coffea default (no buffer-cache) ---
     if cache.startswith("coffea07_"):
         return {"color": "#888888", "linewidth": 2.0, "zorder": 3,
-                "alpha": 1.0}
+                "alpha": 1.0, "marker": "o"}
     if cache == "nocache":
         return {"color": "#000000", "linewidth": 2.0, "zorder": 3,
-                "alpha": 1.0}
+                "alpha": 1.0, "marker": "o"}
 
     # --- warm  = pure in-memory (unbounded) ---
-    if cache == "inmemory":
-        if codec == "blosc":
-            return {"color": "#E69F00", "linewidth": 2.2, "zorder": 3, "alpha": 1.0}
-        # faded
-        return {"color": "#D55E00", "linewidth": 1.0, "zorder": 1, "alpha": 0.40, "linestyle": "--"}
+    if cache == "inmemory" and codec == "blosc":
+        return {"color": "#E69F00", "linewidth": 2.2, "zorder": 3,
+                "alpha": 1.0, "marker": "o"}
 
     # --- green = LRU (evicting memory cache) ---
-    if cache in ("inmemory_lru_100MiB", "inmemory_lru_500MiB"):
-        return {"color": "#009E73", "linewidth": 1.0, "zorder": 1,
-                "alpha": 0.40, "linestyle": "--"} if codec == "none" else {"color": "#56B4C9", "linewidth": 1.0, "zorder": 1, "alpha": 0.40, "linestyle": "--"}
+    if cache == "inmemory_lru_500MiB" and codec == "blosc":
+        return {"color": "#009E73", "linewidth": 2.0, "zorder": 3,
+                "alpha": 1.0, "marker": "o"}
 
     # --- blue = on-disk (cold storage) ---
     if cache == "ondisk":
         if codec == "none":
-            return {"color": "#0072B2", "linewidth": 2.2, "zorder": 3, "alpha": 1.0}
-        else:
-            return {"color": "#56B4E9", "linewidth": 1.0, "zorder": 1,
-                    "alpha": 0.40, "linestyle": "--"}
+            return {"color": "#0072B2", "linewidth": 2.2, "zorder": 3,
+                    "alpha": 1.0, "marker": "o"}
+        return {"color": "#56B4E9", "linewidth": 2.0, "zorder": 3,
+                "alpha": 1.0, "marker": "o"}
 
     # Fallback for any unknown series
     cmap = plt.get_cmap("tab20")
@@ -212,7 +228,8 @@ def _resolve_style(key: tuple, all_keys: list) -> dict:
     except ValueError:
         idx = 0
     color = cmap(idx % cmap.N)
-    return {"color": color, "linewidth": 1.0, "alpha": 0.40, "linestyle": "--", "zorder": 1}
+    return {"color": color, "linewidth": 2.0, "alpha": 1.0,
+            "zorder": 3, "marker": "o"}
 
 
 def _is_highlighted(key: tuple) -> bool:
@@ -228,40 +245,24 @@ def _is_highlighted(key: tuple) -> bool:
 
 
 def _sort_by_peak_rss(data: dict, baseline_key: tuple | None) -> list:
-    """Return keys sorted by desired legend order.
+    """Return keys sorted by peak RSS at 1M events (descending).
 
-    Fixed top 4:
-        1. nocache + none
-        2. coffea07_* (any)
-        3. inmemory + blosc
-        4. ondisk + none
-    Remainder sorted by worst (highest) peak RSS → best (lowest) using the
-    largest entry_stop value present in every series.
+    Tries to use the exact entry_stop == 1_000_000 point; otherwise falls
+    back to the closest point available.
     """
-    # (cache, codec) -> sort_rank (lower = earlier in legend)
-    fixed_ranks = {
-        ("nocache", "none"): 0,
-        ("inmemory", "blosc"): 2,
-        ("ondisk", "none"): 3,
-    }
+    TARGET = 1_000_000
 
     def _key(item):
         key, points = item
-        cache, codec = key
-        # coffea07 entries get rank 1
-        if cache.startswith("coffea07_"):
-            return (1, 0.0)
-        # other fixed-rank entries
-        if key in fixed_ranks:
-            return (fixed_ranks[key], 0.0)
-        # everything else by peak RSS descending at last common entry_stop
-        if baseline_key and baseline_key in data:
-            last_es = data[baseline_key][-1][0]
-            for p in reversed(points):
-                if p[0] <= last_es:
-                    return (len(fixed_ranks) + 1, -p[1])
-        # fallback: use last point
-        return (len(fixed_ranks) + 1, -points[-1][1] if points else 0.0)
+        if not points:
+            return 0.0
+        # try exact match first
+        for p in points:
+            if p[0] == TARGET:
+                return -p[1]  # negative so descending RSS
+        # fallback: closest point
+        closest = min(points, key=lambda p: abs(p[0] - TARGET))
+        return -closest[1]
 
     return [k for k, _ in sorted(data.items(), key=_key)]
 
@@ -282,12 +283,13 @@ def plot_agc_results(data: dict, output_dir: str) -> None:
         peak_rss = [p[1] for p in points]
         label = _prettify_label(cache, codec)
         style = _resolve_style(key, keys_sorted)
-        mkargs = {"marker": "o"} if _is_highlighted(key) else {"marker": "o", "markersize": 3}
-        ax.plot(entry_stops, peak_rss, label=label, **mkargs, **style)
+        ax.plot(entry_stops, peak_rss, label=label, **style)
 
     ax.set_xlabel("Number of events (millions)")
     ax.set_ylabel("Peak RSS (GB)")
     ax.set_title("Peak RSS vs Number of Events")
+    ymax = max(p[1] for pts in data.values() for p in pts) * 1.25
+    ax.set_ylim(top=ymax)
     ax.legend(title="Buffer Cache", loc="best")
     ax.grid(True, linestyle="--", alpha=0.5)
     _densify_ticks(ax)
@@ -304,8 +306,7 @@ def plot_agc_results(data: dict, output_dir: str) -> None:
         runtimes = [p[2] for p in points]
         label = _prettify_label(cache, codec)
         style = _resolve_style(key, keys_sorted)
-        mkargs = {"marker": "o"} if _is_highlighted(key) else {"marker": "o", "markersize": 3}
-        ax.plot(entry_stops, runtimes, label=label, **mkargs, **style)
+        ax.plot(entry_stops, runtimes, label=label, **style)
 
     ax.set_xlabel("Number of events (millions)")
     ax.set_ylabel("Runtime (s)")
@@ -333,8 +334,7 @@ def plot_agc_results(data: dict, output_dir: str) -> None:
         improvements = [p[1] for p in points]
         label = _prettify_label(cache, codec)
         style = _resolve_style(key, keys_sorted_rel)
-        mkargs = {"marker": "o"} if _is_highlighted(key) else {"marker": "o", "markersize": 3}
-        ax.plot(entry_stops, improvements, label=label, **mkargs, **style)
+        ax.plot(entry_stops, improvements, label=label, **style)
 
     ax.axhline(0, color="black", linestyle="-", linewidth=0.8)
     ax.set_xlabel("Number of events (millions)")
@@ -358,8 +358,7 @@ def plot_agc_results(data: dict, output_dir: str) -> None:
         improvements = [p[1] for p in points]
         label = _prettify_label(cache, codec)
         style = _resolve_style(key, keys_sorted_rel)
-        mkargs = {"marker": "o"} if _is_highlighted(key) else {"marker": "o", "markersize": 3}
-        ax.plot(entry_stops, improvements, label=label, **mkargs, **style)
+        ax.plot(entry_stops, improvements, label=label, **style)
 
     ax.axhline(0, color="black", linestyle="-", linewidth=0.8)
     ax.set_xlabel("Number of events (millions)")
