@@ -39,7 +39,7 @@
               ]  
           ],
           [
-            #place(horizon+right, figure(image("Iris-hep-5-just-graphic.svg", width: auto, height: 220pt)))
+            #place(horizon+right, figure(image("Rice_Shield_280_Blue.svg", width: auto, height: 210pt)))
           ]
         )
       )
