@@ -101,7 +101,7 @@
           [
             #place(horizon+left)[
               #text(size: 36pt)[
-                *Acknowledgements:* This work was supported by the National Science Foundation under Cooperative Agreement PHY-2323298 and grant DE-SC0010103
+                *Acknowledgements:* This work was supported by the National Science Foundation and the Department of Energy under Cooperative Agreement through PHY-2323298 and grant DE-SC0010103
               ]
             ]
           ],
